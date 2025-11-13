@@ -593,6 +593,8 @@ class MonitoringServiceV2:
             
             for shipment in shipments:
                 shipment_name = shipment.get("name", "Без названия")
+                counterparty_name = (shipment.get("agent") or {}).get("name") or "Без контрагента"
+                display_name = f"{shipment_name} ({counterparty_name})"
                 shipment_id = shipment.get("id", "Без ID")
                 
                 # Получаем владельца
@@ -666,6 +668,8 @@ class MonitoringServiceV2:
                     error_info = {
                         "id": shipment_id,
                         "name": shipment_name,
+                        "display_name": display_name,
+                        "counterparty": counterparty_name,
                         "owner": display_owner,
                         "owner_id": owner_id,
                         "moment": moment_dbg,
@@ -682,10 +686,10 @@ class MonitoringServiceV2:
                         "link": self._build_document_link(shipment, "demand")
                     }
                     errors.append(error_info)
-                    logger.warning("❌ Отгрузка '{}' ошибки: {}", shipment_name, "; ".join(issues))
+                    logger.warning("❌ Отгрузка '{}' ошибки: {}", display_name, "; ".join(issues))
                 else:
                     valid_count += 1
-                    logger.debug(f"✅ Отгрузка '{shipment_name}' прошла все проверки")
+                    logger.debug(f"✅ Отгрузка '{display_name}' прошла все проверки")
             
             result = {
                 "total": len(shipments),
@@ -718,7 +722,12 @@ class MonitoringServiceV2:
             return ""  # Не проверяем для других владельцев
     
     def _validate_sales_source(self, document: Dict[str, Any]) -> str:
-        """Проверка источника продажи (для Контакт-центра и физлиц)"""
+        """Проверка источника продажи.
+        
+        Для отгрузок (demand) и отчетов комиссионеров (commissionreportin) поле требуется
+        только если документ ведёт Контакт-центр. Для розничных продаж (retaildemand)
+        требуем поле для Контакт-центра и для контрагентов-физлиц.
+        """
         owner = document.get("owner", {})
         owner_name = owner.get("name", "")
 
@@ -743,11 +752,36 @@ class MonitoringServiceV2:
                         is_contact_center = True
                         break
 
+        doc_type = ((document.get("meta") or {}).get("type") or "").lower()
         company_type = self._get_counterparty_type(document)
         is_physical = company_type == "individual"
 
-        if not is_contact_center and not is_physical:
-            return ""  # Источник обязателен только для КЦ и физлиц
+        require_contact_center = True
+        require_physical = False
+        require_both = False  # Требовать и Контакт-Центр, и физлицо одновременно
+
+        if doc_type in {"demand", "commissionreportin"}:
+            # Для отгрузок и отчетов комиссионеров: проверяем только для физлиц при владельце Контакт Центр
+            # Это работает для RB и RF
+            require_both = True
+        elif doc_type == "retaildemand":
+            require_physical = True
+        else:
+            # Для неизвестных типов оставляем прежнее поведение.
+            require_physical = True
+
+        should_check = False
+        if require_both:
+            # Для отгрузок: требуем и Контакт-Центр, и физлицо
+            if is_contact_center and is_physical:
+                should_check = True
+        elif require_contact_center and is_contact_center:
+            should_check = True
+        elif require_physical and is_physical:
+            should_check = True
+
+        if not should_check:
+            return ""
         
         # Ищем поле "Источник продажи" в attributes
         attributes = document.get("attributes", [])
