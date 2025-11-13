@@ -762,7 +762,7 @@ class MonitoringServiceV2:
 
         if doc_type in {"demand", "commissionreportin"}:
             # Для отгрузок и отчетов комиссионеров: проверяем только для физлиц при владельце Контакт Центр
-            # Это работает для RB и RF
+            # Это работает для RB, RF и KZ
             require_both = True
         elif doc_type == "retaildemand":
             require_physical = True
