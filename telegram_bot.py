@@ -187,6 +187,7 @@ class TelegramMonitoringBot:
         headers = [
             "#",
             "Документ",
+            "Контрагент",
             "Дата",
             "Владелец",
             "Описание",
@@ -209,6 +210,8 @@ class TelegramMonitoringBot:
 
         for idx, error in enumerate(errors, 1):
             name = error.get('name', 'Без названия')
+            display_name = error.get('display_name')
+            counterparty = error.get('counterparty', '')
             moment = error.get('moment', '')
             owner_display = error.get('owner', 'Не указан')
 
@@ -218,7 +221,8 @@ class TelegramMonitoringBot:
 
             ws.append([
                 idx,
-                name,
+                display_name or name,
+                counterparty,
                 moment,
                 owner_display,
                 issues_text,
@@ -294,7 +298,8 @@ class TelegramMonitoringBot:
             for error in owner_errors[:limit]:
                 issues = TelegramMonitoringBot._extract_issues(error)
                 issues_text = '; '.join(issues) if issues else 'Без описания'
-                owner_block_lines.append(f"  • {error.get('name', 'Без названия')}: {issues_text}\n")
+                doc_display = error.get('display_name') or error.get('name') or 'Без названия'
+                owner_block_lines.append(f"  • {doc_display}: {issues_text}\n")
                 link = error.get('link')
                 if link:
                     owner_block_lines.append(f"    {link}\n")
@@ -821,7 +826,8 @@ class TelegramMonitoringBot:
                             pass
  
             else:
-                error_msg = result.get('error_message', 'Неизвестная ошибка')
+                # Обрабатываем ошибки (status == 'error')
+                error_msg = result.get('error') or result.get('error_message') or 'Неизвестная ошибка'
                 await message.edit_text(
                     f'❌ *Ошибка при проверке*\n\n'
                     f'{error_msg}\n\n'

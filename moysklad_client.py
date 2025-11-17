@@ -1,8 +1,10 @@
-import requests
 import base64
 import time
+from collections import deque
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
+
+import requests
 from loguru import logger
 from config import Config
 
@@ -15,15 +17,14 @@ class MoySkladClient:
         self.login, self.password, self.base_url = Config.get_moysklad_credentials(self.region, self.use_test)
         self.auth_header = self._get_auth_header()
         
-        # Настройки лимитов API
-        self.rate_limit = Config.MOYSKLAD_RATE_LIMIT
-        self.daily_limit = Config.MOYSKLAD_DAILY_LIMIT
+        # Настройки задержки между запросами
         self.min_delay = Config.MOYSKLAD_MIN_DELAY
-        
-        # Трекинг запросов
-        self.request_times = []
-        self.daily_requests = 0
-        self.last_request_time = 0
+        self.max_retry_429 = 5
+        self.last_request_time = 0.0
+
+        # Мониторинг ошибок
+        self.error_window_seconds = 60
+        self.error_events = deque()  # (timestamp, status_code, endpoint)
         
         access_type = "тестовый" if self.use_test else "основной"
         logger.info(f"Инициализирован клиент МойСклад для региона {self.region} ({access_type} доступ)")
@@ -34,50 +35,20 @@ class MoySkladClient:
         encoded_credentials = base64.b64encode(credentials.encode()).decode()
         return f"Basic {encoded_credentials}"
     
-    def _check_rate_limit(self):
-        """Проверка и соблюдение лимитов API"""
-        current_time = time.time()
-        
-        # Проверяем дневной лимит
-        if self.daily_requests >= self.daily_limit:
-            logger.warning("Достигнут дневной лимит API МойСклад (1000 запросов)")
-            raise Exception("Достигнут дневной лимит API МойСклад")
-        
-        # Проверяем rate limit (100 запросов в минуту)
-        minute_ago = current_time - 60
-        self.request_times = [t for t in self.request_times if t > minute_ago]
-        
-        if len(self.request_times) >= self.rate_limit:
-            wait_time = 60 - (current_time - self.request_times[0])
-            if wait_time > 0:
-                logger.info(f"Rate limit достигнут, ожидание {wait_time:.1f} секунд")
-                time.sleep(wait_time)
-        
-        # Соблюдаем минимальную задержку между запросами
+    def _apply_request_delay(self):
+        """Минимальная задержка между запросами, чтобы снизить риск 429."""
+        if self.min_delay <= 0:
+            return
+
         if self.last_request_time > 0:
-            time_since_last = current_time - self.last_request_time
+            time_since_last = time.time() - self.last_request_time
             if time_since_last < self.min_delay:
                 sleep_time = self.min_delay - time_since_last
                 logger.debug(f"Задержка {sleep_time:.2f} сек между запросами")
                 time.sleep(sleep_time)
-        
-        # Обновляем трекинг
-        self.request_times.append(current_time)
-        self.daily_requests += 1
-        self.last_request_time = current_time
-        
-        # Сбрасываем счетчики в начале нового дня
-        current_date = date.today()
-        if not hasattr(self, '_last_date') or self._last_date != current_date:
-            self._last_date = current_date
-            self.daily_requests = 0
-            logger.info("Сброс дневного счетчика запросов API МойСклад")
     
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict[str, Any]:
         """Выполнение HTTP-запроса к API"""
-        # Проверяем лимиты перед запросом
-        self._check_rate_limit()
-        
         url = f"{self.base_url}{endpoint}"
         headers = {
             "Authorization": self.auth_header,
@@ -85,24 +56,104 @@ class MoySkladClient:
             "Accept-Encoding": "gzip"
         }
         
-        try:
-            logger.debug(f"Отправка запроса к МойСклад: {url}")
-            logger.debug(f"Параметры: {params}")
-            logger.debug(f"Запрос #{self.daily_requests} за сегодня")
-            
-            # Таймауты: (connect, read)
-            response = requests.get(url, headers=headers, params=params, timeout=(5, 60))
-            
-            if response.status_code != 200:
-                logger.error(f"HTTP {response.status_code}: {response.text}")
-                logger.error(f"URL: {url}")
-                logger.error(f"Параметры: {params}")
-            
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка запроса к API МойСклад: {e}")
-            raise
+        attempt = 0
+
+        while True:
+            try:
+                # Соблюдаем минимальную задержку между запросами
+                self._apply_request_delay()
+
+                logger.debug(f"Отправка запроса к МойСклад: {url}")
+                logger.debug(f"Параметры: {params}")
+                logger.debug(f"Попытка {attempt + 1}")
+
+                response = requests.get(url, headers=headers, params=params, timeout=(5, 60))
+                self.last_request_time = time.time()
+
+                if response.status_code == 200:
+                    self._prune_error_events()
+                    return response.json()
+
+                # Лимит запросов
+                if response.status_code == 429:
+                    self._register_error(response.status_code, endpoint)
+                    attempt += 1
+                    if attempt > self.max_retry_429:
+                        logger.error("Превышено число попыток повторного запроса после 429")
+                        response.raise_for_status()
+
+                    wait_time = self._calculate_retry_delay(response, attempt)
+                    logger.warning(
+                        f"Получен ответ 429 Too Many Requests. Ожидание {wait_time:.1f} сек перед повтором."
+                    )
+                    time.sleep(wait_time)
+                    continue
+
+                # Другие ошибки
+                if response.status_code >= 400:
+                    self._register_error(response.status_code, endpoint)
+                    logger.error(f"HTTP {response.status_code}: {response.text}")
+                    logger.error(f"URL: {url}")
+                    logger.error(f"Параметры: {params}")
+                    response.raise_for_status()
+
+                # На всякий случай
+                response.raise_for_status()
+                return response.json()
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Ошибка запроса к API МойСклад: {e}")
+                raise
+
+    def _prune_error_events(self):
+        """Удаление устаревших записей об ошибках."""
+        now = time.time()
+        while self.error_events and now - self.error_events[0][0] > self.error_window_seconds:
+            self.error_events.popleft()
+
+    def _register_error(self, status_code: int, endpoint: str):
+        """Логирование и контроль числа ошибок, чтобы не попасть под автоматическое отключение."""
+        now = time.time()
+        self.error_events.append((now, status_code, endpoint))
+        self._prune_error_events()
+
+        # Подсчитываем ошибки за минуту по статусу и endpoint
+        total_errors_last_minute = len(self.error_events)
+        similar_errors = [
+            event
+            for event in self.error_events
+            if event[1] == status_code and event[2] == endpoint
+        ]
+
+        if total_errors_last_minute >= 150:
+            logger.warning(
+                "За последнюю минуту зафиксировано {} ошибок. "
+                "Проверьте корректность запросов, чтобы избежать блокировки API.",
+                total_errors_last_minute
+            )
+
+        similar_count = len(similar_errors)
+        if similar_count >= 180:
+            logger.warning(
+                "За последнюю минуту зафиксировано {} ошибок со статусом {} для ресурса {}. "
+                "Приближаемся к порогу автоматического отключения.",
+                similar_count,
+                status_code,
+                endpoint
+            )
+
+    @staticmethod
+    def _calculate_retry_delay(response: requests.Response, attempt: int) -> float:
+        """Определение задержки перед повтором после 429."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(float(retry_after), 1.0)
+            except ValueError:
+                pass
+
+        # экспоненциальная задержка с верхним пределом
+        return min(30.0, 2 ** attempt)
     
     def get_contractors_for_today(self) -> List[Dict[str, Any]]:
         """Получение контрагентов, созданных сегодня"""
@@ -328,36 +379,6 @@ class MoySkladClient:
         """Получение товаров с ценой выше указанной"""
         return self.get_products_by_price(">", min_price)
     
-    def get_api_stats(self) -> Dict[str, Any]:
-        """Получение статистики использования API"""
-        current_time = time.time()
-        minute_ago = current_time - 60
-        
-        # Запросы за последнюю минуту
-        requests_last_minute = len([t for t in self.request_times if t > minute_ago])
-        
-        # Оставшиеся запросы
-        remaining_daily = self.daily_limit - self.daily_requests
-        remaining_minute = self.rate_limit - requests_last_minute
-        
-        return {
-            "daily_requests": self.daily_requests,
-            "daily_limit": self.daily_limit,
-            "remaining_daily": remaining_daily,
-            "requests_last_minute": requests_last_minute,
-            "minute_limit": self.rate_limit,
-            "remaining_minute": remaining_minute,
-            "last_request_time": self.last_request_time,
-            "min_delay": self.min_delay
-        }
-    
-    def reset_counters(self):
-        """Сброс счетчиков запросов (для тестирования)"""
-        self.request_times = []
-        self.daily_requests = 0
-        self.last_request_time = 0
-        logger.info("Счетчики API МойСклад сброшены")
-
     def get_custom_entity_metadata(self, custom_entity_id: str) -> Dict[str, Any]:
         """Получение метаданных пользовательского справочника"""
         try:
@@ -417,7 +438,18 @@ class MoySkladClient:
         try:
             data = self._make_request("/entity/counterparty", params)
             return data.get("rows", [])
+        except requests.exceptions.HTTPError as e:
+            error_msg = str(e)
+            if "429" in error_msg or "лимит" in error_msg.lower() or "limit" in error_msg.lower():
+                logger.warning(f"Достигнут дневной лимит API МойСклад при получении контрагентов за период {start_date} - {end_date}")
+                raise RuntimeError("Достигнут дневной лимит API МойСклад (1000 запросов). Попробуйте позже.")
+            logger.error(f"Ошибка получения контрагентов за период {start_date} - {end_date}: {e}")
+            raise
         except Exception as e:
+            error_msg = str(e)
+            if "лимит" in error_msg.lower() or "limit" in error_msg.lower():
+                logger.warning(f"Достигнут дневной лимит API МойСклад при получении контрагентов за период {start_date} - {end_date}")
+                raise RuntimeError("Достигнут дневной лимит API МойСклад (1000 запросов). Попробуйте позже.")
             logger.error(f"Ошибка получения контрагентов за период {start_date} - {end_date}: {e}")
             return []
     
@@ -449,7 +481,21 @@ class MoySkladClient:
                         shipment["positions"] = {"rows": []}
             
             return shipments
+        except requests.exceptions.HTTPError as e:
+            error_msg = str(e)
+            if "429" in error_msg or "лимит" in error_msg.lower() or "limit" in error_msg.lower():
+                logger.warning(f"Достигнут дневной лимит API МойСклад при получении отгрузок за период {start_date} - {end_date}")
+                raise RuntimeError("Достигнут дневной лимит API МойСклад (1000 запросов). Попробуйте позже.")
+            logger.error(f"Ошибка получения отгрузок за период {start_date} - {end_date}: {e}")
+            raise
+        except RuntimeError:
+            # Пробрасываем RuntimeError с сообщением о лимите
+            raise
         except Exception as e:
+            error_msg = str(e)
+            if "лимит" in error_msg.lower() or "limit" in error_msg.lower():
+                logger.warning(f"Достигнут дневной лимит API МойСклад при получении отгрузок за период {start_date} - {end_date}")
+                raise RuntimeError("Достигнут дневной лимит API МойСклад (1000 запросов). Попробуйте позже.")
             logger.error(f"Ошибка получения отгрузок за период {start_date} - {end_date}: {e}")
             return []
     
@@ -489,4 +535,61 @@ class MoySkladClient:
             return data.get("rows", [])
         except Exception as e:
             logger.error(f"Ошибка получения продаж за период {start_date} - {end_date}: {e}")
+            return []
+    
+    def get_sales_returns_for_period(self, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+        """Получение возвратов покупателей за период"""
+        start_str = f"{start_date.strftime('%Y-%m-%d')} 00:00:00"
+        end_str = f"{end_date.strftime('%Y-%m-%d')} 23:59:59"
+        
+        filter_str = f"created>={start_str};created<={end_str}"
+        
+        params = {
+            "filter": filter_str,
+            "expand": "positions,owner,salesChannel,agent,contract"
+        }
+        
+        try:
+            data = self._make_request("/entity/salesreturn", params)
+            return data.get("rows", [])
+        except Exception as e:
+            logger.error(f"Ошибка получения возвратов покупателей за период {start_date} - {end_date}: {e}")
+            return []
+    
+    def get_retail_returns_for_period(self, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+        """Получение возвратов розницы за период"""
+        start_str = f"{start_date.strftime('%Y-%m-%d')} 00:00:00"
+        end_str = f"{end_date.strftime('%Y-%m-%d')} 23:59:59"
+        
+        filter_str = f"created>={start_str};created<={end_str}"
+        
+        params = {
+            "filter": filter_str,
+            "expand": "positions,owner,salesChannel,agent"
+        }
+        
+        try:
+            data = self._make_request("/entity/retailsalesreturn", params)
+            return data.get("rows", [])
+        except Exception as e:
+            logger.error(f"Ошибка получения возвратов розницы за период {start_date} - {end_date}: {e}")
+            return []
+    
+    def get_commission_returns_for_period(self, start_date: date, end_date: date) -> List[Dict[str, Any]]:
+        """Получение возвратов отчетов комиссионеров за период"""
+        start_str = f"{start_date.strftime('%Y-%m-%d')} 00:00:00"
+        end_str = f"{end_date.strftime('%Y-%m-%d')} 23:59:59"
+        
+        filter_str = f"created>={start_str};created<={end_str}"
+        
+        params = {
+            "filter": filter_str,
+            "expand": "positions,owner,salesChannel,agent,contract"
+        }
+        
+        try:
+            data = self._make_request("/entity/commissionreportout", params)
+            return data.get("rows", [])
+        except Exception as e:
+            logger.error(f"Ошибка получения возвратов комиссионеров за период {start_date} - {end_date}: {e}")
             return []

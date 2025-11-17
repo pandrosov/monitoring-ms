@@ -107,6 +107,32 @@ class MonitoringServiceV2:
             if sales_errors:
                 self.bitrix24_client.send_price_notification("Продажи", sales_errors)
             
+            # Проверяем возвраты (только для РБ и РФ)
+            if self.region in {"RB", "RF"}:
+                # Возвраты покупателей
+                sales_returns_result = self.check_sales_returns_period(start_date, end_date)
+                sales_returns_errors = sales_returns_result.get("errors", [])
+                total_issues += len(sales_returns_errors)
+                
+                if sales_returns_errors:
+                    self.bitrix24_client.send_price_notification("Возвраты покупателей", sales_returns_errors)
+                
+                # Возвраты розницы
+                retail_returns_result = self.check_retail_returns_period(start_date, end_date)
+                retail_returns_errors = retail_returns_result.get("errors", [])
+                total_issues += len(retail_returns_errors)
+                
+                if retail_returns_errors:
+                    self.bitrix24_client.send_price_notification("Возвраты розницы", retail_returns_errors)
+                
+                # Возвраты комиссионеров
+                commission_returns_result = self.check_commission_returns_period(start_date, end_date)
+                commission_returns_errors = commission_returns_result.get("errors", [])
+                total_issues += len(commission_returns_errors)
+                
+                if commission_returns_errors:
+                    self.bitrix24_client.send_price_notification("Возвраты комиссионеров", commission_returns_errors)
+            
             # Отправляем общий отчет
             if total_issues == 0:
                 self.bitrix24_client.send_notification(
@@ -136,7 +162,19 @@ class MonitoringServiceV2:
         
         try:
             # Получаем контрагентов за период
-            contractors = self.moysklad_client.get_contractors_for_period(start_date, end_date)
+            try:
+                contractors = self.moysklad_client.get_contractors_for_period(start_date, end_date)
+            except RuntimeError as e:
+                if "лимит" in str(e).lower():
+                    logger.error(f"❌ {str(e)}")
+                    return {
+                        "total": 0,
+                        "valid": 0,
+                        "errors": [],
+                        "status": "error",
+                        "error": str(e)
+                    }
+                raise
             
             if not contractors:
                 logger.info("📋 Контрагентов за период не найдено")
@@ -173,6 +211,11 @@ class MonitoringServiceV2:
                 type_name_mismatch_error = self._validate_type_name_consistency(contractor)
                 actual_address_error = self._validate_actual_address(contractor)
                 groups_error = self._validate_contractor_groups(contractor)
+                
+                # Проверки справочников
+                contract_type_error = self._validate_contractor_contract_type(contractor)
+                client_type_error = self._validate_contractor_client_type(contractor)
+                region_error = self._validate_contractor_region(contractor)
 
                 issues: List[str] = []
                 if phone_error:
@@ -189,6 +232,12 @@ class MonitoringServiceV2:
                     issues.append(f"Группа: {groups_error}")
                 if type_name_mismatch_error:
                     issues.append(f"Тип ↔ Наименование: {type_name_mismatch_error}")
+                if contract_type_error:
+                    issues.append(f"Тип договора: {contract_type_error}")
+                if client_type_error:
+                    issues.append(f"Тип клиента: {client_type_error}")
+                if region_error:
+                    issues.append(f"Регион РБ: {region_error}")
 
                 if issues:
                     error_info = {
@@ -569,13 +618,103 @@ class MonitoringServiceV2:
         
         return ""  # Нет ошибок
     
+    def _validate_contractor_contract_type(self, contractor: Dict[str, Any]) -> str:
+        """Проверка заполненности справочника 'Тип договора' для контрагентов (РБ и РФ)"""
+        if self.region not in {"RB", "RF"}:
+            return ""
+        
+        def _norm(s: str) -> str:
+            if not isinstance(s, str):
+                return ""
+            return "".join(ch for ch in s.lower() if ch.isalnum())
+        
+        # Ищем поле "Тип договора" в атрибутах
+        attributes = contractor.get("attributes", [])
+        for attr in attributes:
+            attr_name = attr.get("name", "")
+            if _norm(attr_name) in {"типдоговора", "типдоговор"}:
+                val = attr.get("value")
+                if isinstance(val, dict):
+                    value_name = val.get("name", "")
+                    if value_name and str(value_name).strip():
+                        return ""  # Заполнено
+                elif isinstance(val, str) and val.strip():
+                    return ""  # Заполнено
+                return "Тип договора не заполнен"
+        
+        return "Тип договора не найден"
+    
+    def _validate_contractor_client_type(self, contractor: Dict[str, Any]) -> str:
+        """Проверка заполненности справочника 'Тип клиента' для контрагентов (РБ и РФ)"""
+        if self.region not in {"RB", "RF"}:
+            return ""
+        
+        def _norm(s: str) -> str:
+            if not isinstance(s, str):
+                return ""
+            return "".join(ch for ch in s.lower() if ch.isalnum())
+        
+        # Ищем поле "Тип клиента" в атрибутах
+        attributes = contractor.get("attributes", [])
+        for attr in attributes:
+            attr_name = attr.get("name", "")
+            if _norm(attr_name) in {"типклиента", "типклиент"}:
+                val = attr.get("value")
+                if isinstance(val, dict):
+                    value_name = val.get("name", "")
+                    if value_name and str(value_name).strip():
+                        return ""  # Заполнено
+                elif isinstance(val, str) and val.strip():
+                    return ""  # Заполнено
+                return "Тип клиента не заполнен"
+        
+        return "Тип клиента не найден"
+    
+    def _validate_contractor_region(self, contractor: Dict[str, Any]) -> str:
+        """Проверка заполненности справочника 'Регион РБ' для контрагентов (только РБ)"""
+        if self.region != "RB":
+            return ""
+        
+        def _norm(s: str) -> str:
+            if not isinstance(s, str):
+                return ""
+            return "".join(ch for ch in s.lower() if ch.isalnum())
+        
+        # Ищем поле "Регион РБ" в атрибутах
+        attributes = contractor.get("attributes", [])
+        for attr in attributes:
+            attr_name = attr.get("name", "")
+            if _norm(attr_name) in {"регионрб", "регион"}:
+                val = attr.get("value")
+                if isinstance(val, dict):
+                    value_name = val.get("name", "")
+                    if value_name and str(value_name).strip():
+                        return ""  # Заполнено
+                elif isinstance(val, str) and val.strip():
+                    return ""  # Заполнено
+                return "Регион РБ не заполнен"
+        
+        return "Регион РБ не найден"
+    
     def check_shipments_period(self, start_date: date, end_date: date) -> Dict[str, Any]:
         """Проверка отгрузок за период"""
         logger.info(f"🔍 Проверка отгрузок за период {start_date} - {end_date}...")
         
         try:
             # Получаем отгрузки за период
-            shipments = self.moysklad_client.get_shipments_for_period(start_date, end_date)
+            try:
+                shipments = self.moysklad_client.get_shipments_for_period(start_date, end_date)
+            except RuntimeError as e:
+                if "лимит" in str(e).lower():
+                    logger.error(f"❌ {str(e)}")
+                    return {
+                        "total": 0,
+                        "valid": 0,
+                        "errors": [],
+                        "status": "error",
+                        "error": str(e)
+                    }
+                raise
             
             if not shipments:
                 logger.info("📦 Отгрузок за период не найдено")
@@ -592,6 +731,13 @@ class MonitoringServiceV2:
             valid_count = 0
             
             for shipment in shipments:
+                # Фильтр для KZ: исключаем отгрузки с "Kaspi" в комментариях
+                if self.region == "KZ":
+                    description = shipment.get("description", "") or ""
+                    if "kaspi" in description.lower():
+                        logger.debug(f"Пропускаем отгрузку '{shipment.get('name', '')}' - содержит 'Kaspi' в комментариях")
+                        continue
+                
                 shipment_name = shipment.get("name", "Без названия")
                 counterparty_name = (shipment.get("agent") or {}).get("name") or "Без контрагента"
                 display_name = f"{shipment_name} ({counterparty_name})"
@@ -627,6 +773,9 @@ class MonitoringServiceV2:
                 # Проверяем поля договора (Тип договора и Скан)
                 contract_fields_error = self._validate_contract_fields(shipment)
                 
+                # Проверяем тип договора для РФ (для ЮЛ/ИП)
+                contract_type_shipment_error = self._validate_contract_type_shipment(shipment)
+                
                 # Проверяем метод расчета для юр. лиц и ИП
                 payment_method_error = self._validate_payment_method(shipment)
 
@@ -634,7 +783,7 @@ class MonitoringServiceV2:
                 payment_error = self._validate_shipment_payment(shipment)
                 
                 if (owner_error or source_error or channel_error or project_error or price_errors or 
-                    payment_error or contract_error or contract_fields_error or payment_method_error):
+                    payment_error or contract_error or contract_fields_error or payment_method_error or contract_type_shipment_error):
                     issues: List[str] = []
                     if owner_error:
                         issues.append(f"Владелец: {owner_error}")
@@ -648,6 +797,8 @@ class MonitoringServiceV2:
                         issues.append(f"Договор: {contract_error}")
                     if contract_fields_error:
                         issues.append(f"Поля договора: {contract_fields_error}")
+                    if contract_type_shipment_error:
+                        issues.append(f"Тип договора: {contract_type_shipment_error}")
                     if payment_method_error:
                         issues.append(f"Метод расчета: {payment_method_error}")
                     if payment_error:
@@ -679,6 +830,7 @@ class MonitoringServiceV2:
                         "project_error": project_error,
                         "contract_error": contract_error,
                         "contract_fields_error": contract_fields_error,
+                        "contract_type_shipment_error": contract_type_shipment_error,
                         "payment_method_error": payment_method_error,
                         "price_errors": price_errors,
                         "payment_error": payment_error,
@@ -857,20 +1009,37 @@ class MonitoringServiceV2:
         return "Поле 'Канал-продаж' не найдено"
     
     def _validate_shipment_project(self, shipment: Dict[str, Any]) -> str:
-        """Проверка наличия проекта для определенных каналов продаж
+        """Проверка соответствия проекта каналу продаж
         
-        Правила:
-        - Сети → должны быть проекты: федеральные, региональные, локальные
-        - Опт → должны быть проекты: крупный опт, средний опт, салоны
-        - Экспорт → может быть проект: Экспорт Азия (необязательно)
+        Правила на основе таблицы сопоставления:
+        - Сети → должны быть проекты: Федеральные, Региональные, Локальные
+        - Опт → должны быть проекты: Крупный Опт, Средний Опт, Салоны
+        - Фарма → должен быть проект: Аптеки
+        - Экспорт → должен быть проект: Экспорт Азия
         - Транзиты → должны быть проекты: Европа, ОАЭ, Казахстан, Беларусь, Россия
-        - Все остальные каналы → проекта быть не должно
+        - Остальные каналы (Маркетплейсы, Розница ИМ, Розница офлайн, Розница услуги, Розница сертификаты, CTM) → проект не требуется
         """
         def _norm(s: str) -> str:
             """Нормализация строки для сравнения"""
             if not isinstance(s, str):
                 return ""
             return "".join(ch for ch in s.lower() if ch.isalnum())
+        
+        # Таблица сопоставления каналов и проектов
+        CHANNEL_PROJECT_MAPPING = {
+            "сети": ["федеральные", "региональные", "локальные"],
+            "опт": ["крупныйопт", "среднийопт", "салоны"],
+            "фарма": ["аптеки"],
+            "экспорт": ["экспортазия"],
+            "транзиты": ["европа", "оаэ", "казахстан", "беларусь", "россия"],
+            # Каналы без обязательных проектов (пустой список означает, что проект не требуется)
+            "маркетплейсы": [],
+            "розницаим": [],
+            "розницаофлайн": [],
+            "розницауслуги": [],
+            "розницасертификаты": [],
+            "ctm": []
+        }
         
         try:
             # Получаем канал продаж
@@ -908,47 +1077,45 @@ class MonitoringServiceV2:
             elif isinstance(project, str):
                 project_name = project
             
-            project_norm = _norm(project_name)
+            project_norm = _norm(project_name) if project_name else ""
             
-            # Определяем требования к проекту в зависимости от канала
+            # Ищем канал в таблице сопоставления
+            allowed_projects = None
+            for channel_key, projects in CHANNEL_PROJECT_MAPPING.items():
+                if channel_key in channel_norm or channel_norm in channel_key:
+                    allowed_projects = projects
+                    break
             
-            # 1. Сети
-            if "сет" in channel_norm:
-                required_projects = {"федеральные", "региональные", "локальные"}
-                if not project_name:
-                    return f"Для канала '{sales_channel_name}' должен быть указан проект (федеральные/региональные/локальные)"
-                if project_norm not in {_norm(p) for p in required_projects}:
-                    return f"Для канала '{sales_channel_name}' указан некорректный проект '{project_name}'. Ожидается: федеральные, региональные или локальные"
+            # Если канал не найден в таблице, пропускаем проверку
+            if allowed_projects is None:
                 return ""
             
-            # 2. Опт
-            if "опт" in channel_norm:
-                required_projects = {"крупныйопт", "среднийопт", "салоны"}
-                if not project_name:
-                    return f"Для канала '{sales_channel_name}' должен быть указан проект (крупный опт/средний опт/салоны)"
-                if project_norm not in required_projects:
-                    return f"Для канала '{sales_channel_name}' указан некорректный проект '{project_name}'. Ожидается: крупный опт, средний опт или салоны"
+            # Если для канала не требуется проект (пустой список), проверка пройдена
+            if not allowed_projects:
                 return ""
             
-            # 3. Экспорт
-            if "экспорт" in channel_norm:
-                # Проект необязателен, но если указан, то может быть только "Экспорт Азия"
-                if project_name and project_norm != "экспортазия":
-                    return f"Для канала '{sales_channel_name}' указан некорректный проект '{project_name}'. Может быть только: Экспорт Азия"
-                return ""
+            # Для каналов с обязательными проектами проверяем соответствие
+            if not project_name:
+                # Находим ключ канала для формирования сообщения
+                channel_key_found = None
+                for key in CHANNEL_PROJECT_MAPPING.keys():
+                    if key in channel_norm or channel_norm in key:
+                        channel_key_found = key
+                        break
+                expected_list = CHANNEL_PROJECT_MAPPING.get(channel_key_found, allowed_projects) if channel_key_found else allowed_projects
+                return f"Для канала '{sales_channel_name}' должен быть указан проект. Ожидается: {', '.join(expected_list)}"
             
-            # 4. Транзиты
-            if "транзит" in channel_norm:
-                required_projects = {"европа", "оаэ", "казахстан", "беларусь", "россия"}
-                if not project_name:
-                    return f"Для канала '{sales_channel_name}' должен быть указан проект (Европа/ОАЭ/Казахстан/Беларусь/Россия)"
-                if project_norm not in required_projects:
-                    return f"Для канала '{sales_channel_name}' указан некорректный проект '{project_name}'. Ожидается: Европа, ОАЭ, Казахстан, Беларусь или Россия"
-                return ""
-            
-            # 5. Все остальные каналы - проекта не должно быть
-            if project_name:
-                return f"Для канала '{sales_channel_name}' не должно быть указано проекта, но указан: '{project_name}'"
+            # Проверяем, что проект соответствует каналу
+            allowed_projects_norm = {_norm(p) for p in allowed_projects}
+            if project_norm not in allowed_projects_norm:
+                # Находим ключ канала для формирования сообщения
+                channel_key_found = None
+                for key in CHANNEL_PROJECT_MAPPING.keys():
+                    if key in channel_norm or channel_norm in key:
+                        channel_key_found = key
+                        break
+                expected_projects = CHANNEL_PROJECT_MAPPING.get(channel_key_found, allowed_projects) if channel_key_found else allowed_projects
+                return f"Для канала '{sales_channel_name}' указан некорректный проект '{project_name}'. Ожидается: {', '.join(expected_projects)}"
             
             return ""
             
@@ -1064,6 +1231,49 @@ class MonitoringServiceV2:
         
         except Exception as e:
             logger.error(f"Ошибка проверки полей договора: {e}")
+            return ""
+    
+    def _validate_contract_type_shipment(self, shipment: Dict[str, Any]) -> str:
+        """Проверка заполненности типа договора в отгрузках для РФ (для ЮЛ/ИП)"""
+        if self.region != "RF":
+            return ""
+        
+        try:
+            # Проверяем только для юрлиц и ИП
+            company_type = self._get_counterparty_type(shipment)
+            if company_type not in {"legal", "entrepreneur"}:
+                return ""
+            
+            # Получаем договор
+            contract = shipment.get("contract")
+            if not contract or not isinstance(contract, dict):
+                return ""  # Нет договора - не проверяем тип
+            
+            contract_href = contract.get("meta", {}).get("href")
+            if not contract_href:
+                return ""
+            
+            try:
+                # Запрашиваем данные договора
+                contract_data = self.moysklad_client._make_request(
+                    contract_href.replace(self.moysklad_client.base_url, "")
+                )
+                if not contract_data:
+                    return ""
+                
+                # Проверяем тип договора
+                contract_type = contract_data.get("contractType")
+                if not contract_type:
+                    return "Тип договора не заполнен"
+                
+                return ""
+                
+            except Exception as e:
+                logger.warning(f"Не удалось получить данные договора для проверки типа: {e}")
+                return ""
+            
+        except Exception as e:
+            logger.error(f"Ошибка проверки типа договора в отгрузке: {e}")
             return ""
     
     def _validate_payment_method(self, shipment: Dict[str, Any]) -> str:
@@ -1540,6 +1750,303 @@ class MonitoringServiceV2:
             
         except Exception as e:
             logger.error(f"❌ Ошибка проверки продаж: {e}")
+            return {
+                "total": 0,
+                "valid": 0,
+                "errors": [],
+                "status": "error",
+                "error_message": str(e)
+            }
+    
+    def check_sales_returns_period(self, start_date: date, end_date: date) -> Dict[str, Any]:
+        """Проверка возвратов покупателей за период"""
+        logger.info(f"🔍 Проверка возвратов покупателей за период {start_date} - {end_date}...")
+        
+        try:
+            returns = self.moysklad_client.get_sales_returns_for_period(start_date, end_date)
+            
+            if not returns:
+                logger.info("📦 Возвратов покупателей за период не найдено")
+                return {
+                    "total": 0,
+                    "valid": 0,
+                    "errors": [],
+                    "status": "success"
+                }
+            
+            logger.info(f"📦 Найдено возвратов покупателей: {len(returns)}")
+            
+            errors = []
+            valid_count = 0
+            
+            for return_doc in returns:
+                return_name = return_doc.get("name", "Без названия")
+                counterparty_name = (return_doc.get("agent") or {}).get("name") or "Без контрагента"
+                display_name = f"{return_name} ({counterparty_name})"
+                return_id = return_doc.get("id", "Без ID")
+                
+                owner = return_doc.get("owner", {})
+                owner_name, owner_id = self._resolve_owner(owner)
+                display_owner = owner_name
+                
+                # Проверяем канал продаж
+                channel_error = self._validate_sales_channel(return_doc)
+                
+                # Проверяем проект для канала продаж
+                project_error = self._validate_shipment_project(return_doc)
+                
+                # Проверяем цены (только нулевые)
+                price_errors = self._validate_shipment_prices(return_doc)
+                
+                if channel_error or project_error or price_errors:
+                    issues: List[str] = []
+                    if channel_error:
+                        issues.append(f"Канал продаж: {channel_error}")
+                    if project_error:
+                        issues.append(f"Проект: {project_error}")
+                    if price_errors:
+                        for pe in price_errors:
+                            product_name = pe.get('product', 'Неизвестный товар')
+                            issue_text = pe.get('issue', 'Проблема с ценой')
+                            price_val = pe.get('price')
+                            qty_val = pe.get('quantity')
+                            details = f"Позиция '{product_name}': {issue_text}"
+                            if price_val is not None:
+                                details += f", цена={price_val}"
+                            if qty_val is not None:
+                                details += f", кол-во={qty_val}"
+                            issues.append(details)
+                    
+                    error_info = {
+                        "id": return_id,
+                        "name": return_name,
+                        "display_name": display_name,
+                        "counterparty": counterparty_name,
+                        "owner": display_owner,
+                        "owner_id": owner_id,
+                        "moment": return_doc.get("moment", ""),
+                        "channel_error": channel_error,
+                        "project_error": project_error,
+                        "price_errors": price_errors,
+                        "issues": issues,
+                        "link": self._build_document_link(return_doc, "salesreturn")
+                    }
+                    errors.append(error_info)
+                    logger.warning(f"❌ Возврат покупателя '{display_name}' ошибки: {'; '.join(issues)}")
+                else:
+                    valid_count += 1
+                    logger.debug(f"✅ Возврат покупателя '{display_name}' прошел все проверки")
+            
+            result = {
+                "total": len(returns),
+                "valid": valid_count,
+                "errors": errors,
+                "status": "success"
+            }
+            
+            logger.info(f"✅ Проверка возвратов покупателей завершена. Всего: {len(returns)}, Валидных: {valid_count}, Ошибок: {len(errors)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки возвратов покупателей: {e}")
+            return {
+                "total": 0,
+                "valid": 0,
+                "errors": [],
+                "status": "error",
+                "error_message": str(e)
+            }
+    
+    def check_retail_returns_period(self, start_date: date, end_date: date) -> Dict[str, Any]:
+        """Проверка возвратов розницы за период"""
+        logger.info(f"🔍 Проверка возвратов розницы за период {start_date} - {end_date}...")
+        
+        try:
+            returns = self.moysklad_client.get_retail_returns_for_period(start_date, end_date)
+            
+            if not returns:
+                logger.info("📦 Возвратов розницы за период не найдено")
+                return {
+                    "total": 0,
+                    "valid": 0,
+                    "errors": [],
+                    "status": "success"
+                }
+            
+            logger.info(f"📦 Найдено возвратов розницы: {len(returns)}")
+            
+            errors = []
+            valid_count = 0
+            
+            for return_doc in returns:
+                return_name = return_doc.get("name", "Без названия")
+                counterparty_name = (return_doc.get("agent") or {}).get("name") or "Без контрагента"
+                display_name = f"{return_name} ({counterparty_name})"
+                return_id = return_doc.get("id", "Без ID")
+                
+                owner = return_doc.get("owner", {})
+                owner_name, owner_id = self._resolve_owner(owner)
+                display_owner = owner_name
+                
+                # Проверяем канал продаж
+                channel_error = self._validate_sales_channel(return_doc)
+                
+                # Проверяем проект для канала продаж
+                project_error = self._validate_shipment_project(return_doc)
+                
+                # Проверяем цены (только нулевые)
+                price_errors = self._validate_shipment_prices(return_doc)
+                
+                if channel_error or project_error or price_errors:
+                    issues: List[str] = []
+                    if channel_error:
+                        issues.append(f"Канал продаж: {channel_error}")
+                    if project_error:
+                        issues.append(f"Проект: {project_error}")
+                    if price_errors:
+                        for pe in price_errors:
+                            product_name = pe.get('product', 'Неизвестный товар')
+                            issue_text = pe.get('issue', 'Проблема с ценой')
+                            price_val = pe.get('price')
+                            qty_val = pe.get('quantity')
+                            details = f"Позиция '{product_name}': {issue_text}"
+                            if price_val is not None:
+                                details += f", цена={price_val}"
+                            if qty_val is not None:
+                                details += f", кол-во={qty_val}"
+                            issues.append(details)
+                    
+                    error_info = {
+                        "id": return_id,
+                        "name": return_name,
+                        "display_name": display_name,
+                        "counterparty": counterparty_name,
+                        "owner": display_owner,
+                        "owner_id": owner_id,
+                        "moment": return_doc.get("moment", ""),
+                        "channel_error": channel_error,
+                        "project_error": project_error,
+                        "price_errors": price_errors,
+                        "issues": issues,
+                        "link": self._build_document_link(return_doc, "retailsalesreturn")
+                    }
+                    errors.append(error_info)
+                    logger.warning(f"❌ Возврат розницы '{display_name}' ошибки: {'; '.join(issues)}")
+                else:
+                    valid_count += 1
+                    logger.debug(f"✅ Возврат розницы '{display_name}' прошел все проверки")
+            
+            result = {
+                "total": len(returns),
+                "valid": valid_count,
+                "errors": errors,
+                "status": "success"
+            }
+            
+            logger.info(f"✅ Проверка возвратов розницы завершена. Всего: {len(returns)}, Валидных: {valid_count}, Ошибок: {len(errors)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки возвратов розницы: {e}")
+            return {
+                "total": 0,
+                "valid": 0,
+                "errors": [],
+                "status": "error",
+                "error_message": str(e)
+            }
+    
+    def check_commission_returns_period(self, start_date: date, end_date: date) -> Dict[str, Any]:
+        """Проверка возвратов комиссионеров за период"""
+        logger.info(f"🔍 Проверка возвратов комиссионеров за период {start_date} - {end_date}...")
+        
+        try:
+            returns = self.moysklad_client.get_commission_returns_for_period(start_date, end_date)
+            
+            if not returns:
+                logger.info("📦 Возвратов комиссионеров за период не найдено")
+                return {
+                    "total": 0,
+                    "valid": 0,
+                    "errors": [],
+                    "status": "success"
+                }
+            
+            logger.info(f"📦 Найдено возвратов комиссионеров: {len(returns)}")
+            
+            errors = []
+            valid_count = 0
+            
+            for return_doc in returns:
+                return_name = return_doc.get("name", "Без названия")
+                counterparty_name = (return_doc.get("agent") or {}).get("name") or "Без контрагента"
+                display_name = f"{return_name} ({counterparty_name})"
+                return_id = return_doc.get("id", "Без ID")
+                
+                owner = return_doc.get("owner", {})
+                owner_name, owner_id = self._resolve_owner(owner)
+                display_owner = owner_name
+                
+                # Проверяем канал продаж
+                channel_error = self._validate_sales_channel(return_doc)
+                
+                # Проверяем проект для канала продаж
+                project_error = self._validate_shipment_project(return_doc)
+                
+                # Проверяем цены (только нулевые)
+                price_errors = self._validate_shipment_prices(return_doc)
+                
+                if channel_error or project_error or price_errors:
+                    issues: List[str] = []
+                    if channel_error:
+                        issues.append(f"Канал продаж: {channel_error}")
+                    if project_error:
+                        issues.append(f"Проект: {project_error}")
+                    if price_errors:
+                        for pe in price_errors:
+                            product_name = pe.get('product', 'Неизвестный товар')
+                            issue_text = pe.get('issue', 'Проблема с ценой')
+                            price_val = pe.get('price')
+                            qty_val = pe.get('quantity')
+                            details = f"Позиция '{product_name}': {issue_text}"
+                            if price_val is not None:
+                                details += f", цена={price_val}"
+                            if qty_val is not None:
+                                details += f", кол-во={qty_val}"
+                            issues.append(details)
+                    
+                    error_info = {
+                        "id": return_id,
+                        "name": return_name,
+                        "display_name": display_name,
+                        "counterparty": counterparty_name,
+                        "owner": display_owner,
+                        "owner_id": owner_id,
+                        "moment": return_doc.get("moment", ""),
+                        "channel_error": channel_error,
+                        "project_error": project_error,
+                        "price_errors": price_errors,
+                        "issues": issues,
+                        "link": self._build_document_link(return_doc, "commissionreportout")
+                    }
+                    errors.append(error_info)
+                    logger.warning(f"❌ Возврат комиссионера '{display_name}' ошибки: {'; '.join(issues)}")
+                else:
+                    valid_count += 1
+                    logger.debug(f"✅ Возврат комиссионера '{display_name}' прошел все проверки")
+            
+            result = {
+                "total": len(returns),
+                "valid": valid_count,
+                "errors": errors,
+                "status": "success"
+            }
+            
+            logger.info(f"✅ Проверка возвратов комиссионеров завершена. Всего: {len(returns)}, Валидных: {valid_count}, Ошибок: {len(errors)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка проверки возвратов комиссионеров: {e}")
             return {
                 "total": 0,
                 "valid": 0,

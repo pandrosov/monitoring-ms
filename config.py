@@ -52,8 +52,6 @@ class Config:
     MIN_PRICE_THRESHOLD = float(os.getenv("MIN_PRICE_THRESHOLD", "0.01"))
     
     # Настройки API МойСклад
-    MOYSKLAD_RATE_LIMIT = int(os.getenv("MOYSKLAD_RATE_LIMIT", "100"))  # запросов в минуту
-    MOYSKLAD_DAILY_LIMIT = int(os.getenv("MOYSKLAD_DAILY_LIMIT", "1000"))  # запросов в день
     MOYSKLAD_MIN_DELAY = float(os.getenv("MOYSKLAD_MIN_DELAY", "0.1"))  # секунд между запросами
     
     # Настройки логирования
