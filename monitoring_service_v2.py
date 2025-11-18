@@ -212,10 +212,14 @@ class MonitoringServiceV2:
                 actual_address_error = self._validate_actual_address(contractor)
                 groups_error = self._validate_contractor_groups(contractor)
                 
-                # Проверки справочников
-                contract_type_error = self._validate_contractor_contract_type(contractor)
-                client_type_error = self._validate_contractor_client_type(contractor)
-                region_error = self._validate_contractor_region(contractor)
+                # Проверки справочников (только для ЮЛ/ИП)
+                contract_type_error = ""
+                client_type_error = ""
+                region_error = ""
+                if company_type in {"legal", "entrepreneur"}:
+                    contract_type_error = self._validate_contractor_contract_type(contractor)
+                    client_type_error = self._validate_contractor_client_type(contractor)
+                    region_error = self._validate_contractor_region(contractor)
 
                 issues: List[str] = []
                 if phone_error:
