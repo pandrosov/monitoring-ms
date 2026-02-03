@@ -184,28 +184,50 @@ class TelegramMonitoringBot:
         ws = wb.active
         ws.title = "Ошибки"
 
-        headers = [
-            "#",
-            "Документ",
-            "Контрагент",
-            "Дата",
-            "Владелец",
-            "Описание",
-            "Ошибка канала",
-            "Ошибка проекта",
-            "Ошибка источника",
-            "Ошибка договора",
-            "Ошибка полей договора",
-            "Ошибка метода расчета",
-            "Ошибка оплаты",
-            "Ошибка телефона",
-            "Ошибка согласия ПД",
-            "Ошибка даты ПД",
-            "Ошибка УНП/ИНН",
-            "Ошибка фактического адреса",
-            "Ошибка группы",
-            "Ссылка"
-        ]
+        # Для отгрузок добавляем разделение на основные проверки и проверки договоров
+        if document == 'shipments':
+            headers = [
+                "#",
+                "Документ",
+                "Контрагент",
+                "Дата",
+                "Владелец",
+                "Описание",
+                "Основные проверки",
+                "Проверки договоров",
+                "Ошибка канала",
+                "Ошибка проекта",
+                "Ошибка источника",
+                "Ошибка договора",
+                "Ошибка полей договора",
+                "Ошибка типа договора",
+                "Ошибка метода расчета",
+                "Ошибка оплаты",
+                "Ссылка"
+            ]
+        else:
+            headers = [
+                "#",
+                "Документ",
+                "Контрагент",
+                "Дата",
+                "Владелец",
+                "Описание",
+                "Ошибка канала",
+                "Ошибка проекта",
+                "Ошибка источника",
+                "Ошибка договора",
+                "Ошибка полей договора",
+                "Ошибка метода расчета",
+                "Ошибка оплаты",
+                "Ошибка телефона",
+                "Ошибка согласия ПД",
+                "Ошибка даты ПД",
+                "Ошибка УНП/ИНН",
+                "Ошибка фактического адреса",
+                "Ошибка группы",
+                "Ссылка"
+            ]
         ws.append(headers)
 
         for idx, error in enumerate(errors, 1):
@@ -219,28 +241,55 @@ class TelegramMonitoringBot:
             issues_text = " | ".join(issues) if issues else "Без описания"
             link = error.get('link', '')
 
-            ws.append([
-                idx,
-                display_name or name,
-                counterparty,
-                moment,
-                owner_display,
-                issues_text,
-                error.get('channel_error', ''),
-                error.get('project_error', ''),
-                error.get('source_error', ''),
-                error.get('contract_error', ''),
-                error.get('contract_fields_error', ''),
-                error.get('payment_method_error', ''),
-                error.get('payment_error', ''),
-                error.get('phone_error', ''),
-                error.get('pd_agreement_error', ''),
-                error.get('pd_date_error', ''),
-                error.get('unp_error', ''),
-                error.get('actual_address_error', ''),
-                error.get('groups_error', ''),
-                link
-            ])
+            if document == 'shipments':
+                # Для отгрузок разделяем на основные проверки и проверки договоров
+                main_issues = error.get('main_issues', [])
+                contract_issues = error.get('contract_issues', [])
+                main_issues_text = " | ".join(main_issues) if main_issues else ""
+                contract_issues_text = " | ".join(contract_issues) if contract_issues else ""
+                
+                ws.append([
+                    idx,
+                    display_name or name,
+                    counterparty,
+                    moment,
+                    owner_display,
+                    issues_text,
+                    main_issues_text,
+                    contract_issues_text,
+                    error.get('channel_error', ''),
+                    error.get('project_error', ''),
+                    error.get('source_error', ''),
+                    error.get('contract_error', ''),
+                    error.get('contract_fields_error', ''),
+                    error.get('contract_type_shipment_error', ''),
+                    error.get('payment_method_error', ''),
+                    error.get('payment_error', ''),
+                    link
+                ])
+            else:
+                ws.append([
+                    idx,
+                    display_name or name,
+                    counterparty,
+                    moment,
+                    owner_display,
+                    issues_text,
+                    error.get('channel_error', ''),
+                    error.get('project_error', ''),
+                    error.get('source_error', ''),
+                    error.get('contract_error', ''),
+                    error.get('contract_fields_error', ''),
+                    error.get('payment_method_error', ''),
+                    error.get('payment_error', ''),
+                    error.get('phone_error', ''),
+                    error.get('pd_agreement_error', ''),
+                    error.get('pd_date_error', ''),
+                    error.get('unp_error', ''),
+                    error.get('actual_address_error', ''),
+                    error.get('groups_error', ''),
+                    link
+                ])
 
         safe_document = document.replace(' ', '_')
         filename = f"report_{safe_document}_{region}_{date_from.strftime('%Y%m%d')}_{date_to.strftime('%Y%m%d')}.xlsx"
@@ -296,10 +345,28 @@ class TelegramMonitoringBot:
             limit = MAX_DOCUMENTS_PER_OWNER if MAX_DOCUMENTS_PER_OWNER is not None else len(owner_errors)
 
             for error in owner_errors[:limit]:
-                issues = TelegramMonitoringBot._extract_issues(error)
-                issues_text = '; '.join(issues) if issues else 'Без описания'
                 doc_display = error.get('display_name') or error.get('name') or 'Без названия'
-                owner_block_lines.append(f"  • {doc_display}: {issues_text}\n")
+                
+                # Для отгрузок разделяем на основные проверки и проверки договоров
+                if document == 'shipments':
+                    main_issues = error.get('main_issues', [])
+                    contract_issues = error.get('contract_issues', [])
+                    
+                    if main_issues or contract_issues:
+                        owner_block_lines.append(f"  • {doc_display}:\n")
+                        if main_issues:
+                            main_text = '; '.join(main_issues)
+                            owner_block_lines.append(f"    📋 Основные проверки: {main_text}\n")
+                        if contract_issues:
+                            contract_text = '; '.join(contract_issues)
+                            owner_block_lines.append(f"    📄 Проверки договоров: {contract_text}\n")
+                    else:
+                        owner_block_lines.append(f"  • {doc_display}: Без описания\n")
+                else:
+                    issues = TelegramMonitoringBot._extract_issues(error)
+                    issues_text = '; '.join(issues) if issues else 'Без описания'
+                    owner_block_lines.append(f"  • {doc_display}: {issues_text}\n")
+                
                 link = error.get('link')
                 if link:
                     owner_block_lines.append(f"    {link}\n")

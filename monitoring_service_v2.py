@@ -788,25 +788,16 @@ class MonitoringServiceV2:
                 
                 if (owner_error or source_error or channel_error or project_error or price_errors or 
                     payment_error or contract_error or contract_fields_error or payment_method_error or contract_type_shipment_error):
-                    issues: List[str] = []
+                    # Основные проверки
+                    main_issues: List[str] = []
                     if owner_error:
-                        issues.append(f"Владелец: {owner_error}")
+                        main_issues.append(f"Владелец: {owner_error}")
                     if source_error:
-                        issues.append(f"Источник продажи: {source_error}")
+                        main_issues.append(f"Источник продажи: {source_error}")
                     if channel_error:
-                        issues.append(f"Канал продаж: {channel_error}")
+                        main_issues.append(f"Канал продаж: {channel_error}")
                     if project_error:
-                        issues.append(f"Проект: {project_error}")
-                    if contract_error:
-                        issues.append(f"Договор: {contract_error}")
-                    if contract_fields_error:
-                        issues.append(f"Поля договора: {contract_fields_error}")
-                    if contract_type_shipment_error:
-                        issues.append(f"Тип договора: {contract_type_shipment_error}")
-                    if payment_method_error:
-                        issues.append(f"Метод расчета: {payment_method_error}")
-                    if payment_error:
-                        issues.append(f"Оплата: {payment_error}")
+                        main_issues.append(f"Проект: {project_error}")
                     if price_errors:
                         for pe in price_errors:
                             product_name = pe.get('product', 'Неизвестный товар')
@@ -818,7 +809,23 @@ class MonitoringServiceV2:
                                 details += f", цена={price_val}"
                             if qty_val is not None:
                                 details += f", кол-во={qty_val}"
-                            issues.append(details)
+                            main_issues.append(details)
+                    
+                    # Проверки договоров
+                    contract_issues: List[str] = []
+                    if contract_error:
+                        contract_issues.append(f"Договор: {contract_error}")
+                    if contract_fields_error:
+                        contract_issues.append(f"Поля договора: {contract_fields_error}")
+                    if contract_type_shipment_error:
+                        contract_issues.append(f"Тип договора: {contract_type_shipment_error}")
+                    if payment_method_error:
+                        contract_issues.append(f"Метод расчета: {payment_method_error}")
+                    if payment_error:
+                        contract_issues.append(f"Оплата: {payment_error}")
+                    
+                    # Общий список всех ошибок (для обратной совместимости)
+                    issues: List[str] = main_issues + contract_issues
 
                     error_info = {
                         "id": shipment_id,
@@ -838,6 +845,8 @@ class MonitoringServiceV2:
                         "payment_method_error": payment_method_error,
                         "price_errors": price_errors,
                         "payment_error": payment_error,
+                        "main_issues": main_issues,
+                        "contract_issues": contract_issues,
                         "issues": issues,
                         "link": self._build_document_link(shipment, "demand")
                     }
